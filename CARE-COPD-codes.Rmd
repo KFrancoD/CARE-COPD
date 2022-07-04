@@ -1,0 +1,258 @@
+---
+title: "CARE-COPD"
+author: "Franco CHENG"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+# Library & Data Loading
+```{r}
+library(tidyverse)
+library(data.table)
+library(lubridate)
+library(tableone)
+library(WeightIt)
+library(survey)
+library(SCCS)
+library(gtsummary)
+
+cohort.raw <- readRDS("D:/R_batch6/4.cohort_full.RDS")
+cohort.full <- haven::read_sas("/Users/francocheng/Documents/Pharmacy/PhD Project/CARE/CARE-COPD/cohortana.sas7bdat")
+cohort.third <- haven::read_sas("/Users/francocheng/Documents/Pharmacy/PhD Project/CARE/CARE-COPD/cohort1.sas7bdat")
+load("D:/R_batch6/DX.RData")
+LAB_ALL_COVID <- readRDS("D:/R_batch6/LAB_ALL_COVID.RDS")
+LAB_CHP_COVID <- readRDS("E:/LAB_CHP_COVID.RDS")
+RX_latest <- readRDS("D:/R_batch6/RX_latest.RDS")
+RX_clean <- readRDS("D:/R_batch6/RX_clean.RDS")
+
+setDT(cohort.full)
+setDT(cohort.third)
+setDT(dx_clean)
+setDT(dx_freq)
+setDT(dx_latest)
+setDT(LAB_ALL_COVID)
+setDT(LAB_CHP_COVID)
+setDT(RX_latest)
+list2env(RX_clean, globalenv())
+setDT(`2018`)
+setDT(`2019`)
+setDT(`2020`)
+```
+
+# Inclusion criteria
+## at least one hospital admission for COPD/asthma (ICD-9-CM: 490-496)
+```{r}
+dx_clean <- dx_clean[,date.dx:=as.Date(paste0(date, "-15"))] 
+dx_latest <- dx_latest[,date.dx:=as.Date(date)] 
+
+dx.COPD.ids <- bind_rows(dx_clean, dx_latest)[str_detect(code, "^49[0-6]")]
+
+dx.COPD.ids <- merge(dx.COPD.ids, cohort.full[,.(patient_pssn = id, index.date = index)]
+                     )[date.dx < index.date & Source == "1.IP", unique(patient_pssn)]
+
+cohort.full[!id %in% dx.COPD.ids, exc := 1]
+```
+
+## prescription of inhaled corticosteroids (BNF 3.2) or bronchodilators (BNF 3.1)
+```{r}
+RX_latest <- RX_latest[, date.rx := as.Date(disp_date_ymd)]
+`2018` <- `2018`[, date.rx := as.Date(paste0(disp_date_ym, "-15"))]
+`2019` <- `2019`[, date.rx := as.Date(paste0(disp_date_ym, "-15"))]
+`2020` <- `2020`[, date.rx := as.Date(paste0(disp_date_ym, "-15"))]
+
+rx.COPD.ids <- merge(RX_latest[grepl("^3.1|^3.2", bnfno_p)], 
+                     cohort.full[,.(patient_pssn = id, index.date = index)],
+                     all.x = TRUE, by = "patient_pssn"
+                     )[date.rx < index.date, unique(patient_pssn)]
+
+rx.COPD.ids <- unique(c(rx.COPD.ids, 
+                        `2018`[grepl("^3.1|^3.2", bnfno_p), unique(patient_pssn)],
+                        `2019`[grepl("^3.1|^3.2", bnfno_p), unique(patient_pssn)],
+                        `2020`[grepl("^3.1|^3.2", bnfno_p), unique(patient_pssn)]))
+
+cohort.full[is.na(exc) & !id %in% rx.COPD.ids, exc := 1]
+```
+
+## Age ≥ 18
+```{r}
+cohort.full[age < 18, exc := 1]
+```
+
+# Exclusion criteria
+## 1) heterogeneity first two doses, 2) heterogeneity for booster dose, and 3) people taking four vaccinations
+```{r}
+cohort.full[cohort.full$vac1brand == "NA"]$vac1brand <- NA
+cohort.full[cohort.full$vac2brand == "NA"]$vac2brand <- NA
+cohort.full[cohort.full$vac3brand == "NA"]$vac3brand <- NA
+cohort.full[cohort.full$vac4brand == "NA"]$vac4brand <- NA
+
+cohort.full$vaccine.type <- cohort.full[,.(vac1brand, vac2brand, vac3brand, vac4brand)
+                                        ][,apply(apply(.SD,2,function(x) substr(x,1,1)),1,function(x) paste(na.omit(x),collapse = ''))]
+
+cohort.full[!is.na(vac4brand), exc:=1]
+
+cohort.full[is.na(exc) & grepl("SB|BS", vaccine.type), exc:=1]
+```
+
+# Outcomes
+## Mortality with COVID-19
+```{r}
+COVID.pcr <- bind_rows(LAB_ALL_COVID[str_detect(T_NUM, "^21[3-7]") 
+                                     & result == "detected" 
+                                     & as.Date(date) >= as.Date("2020-01-01")
+                                     ][,.(patient_pssn, date.COVID = as.Date(date))],
+                       merge(LAB_CHP_COVID,
+                             cohort.raw[,.(PseudoID, patient_pssn)],
+                             all.x = TRUE
+                             )[test_pos == "PCR" & !is.na(patient_pssn),
+                               .(patient_pssn, 
+                                 date.COVID = pmin(as.Date(report.date),
+                                                   as.Date(date), 
+                                                   na.rm = TRUE))])
+
+COVID.pcr <- COVID.pcr[order(date.COVID),.SD[1],patient_pssn]
+
+cohort.full <- merge(cohort.full, COVID.pcr, 
+                     by.x = "id", by.y = "patient_pssn", all.x = TRUE)
+
+
+cohort.full[dod - date.COVID <= 28, event.COVIDdeath := 1]
+
+cohort.full[event.COVIDdeath == 1 & grepl("^S|^T", death_diag_cd), event.COVIDdeath := 0]
+
+cohort.full[is.na(event.COVIDdeath), event.COVIDdeath := 0]
+```
+
+## Respiratory composite outcomes
+```{r}
+outcome.resp <- bind_rows(dx_clean, dx_latest)[str_detect(code, "^49[0-6]|^518.8[1-4]")]
+
+outcome.resp <- merge(outcome.resp, cohort.full[,.(patient_pssn = id, date.COVID)],
+                      all.x = TRUE
+                      )[date.dx <= date.COVID+28 & date.dx >= date.COVID-3
+                        ][order(date.dx), .SD[1], patient_pssn]
+
+cohort.full <- merge(cohort.full, outcome.resp[,.(id = patient_pssn, date.resp = date.dx)],
+                     all.x = TRUE)
+
+cohort.full[,event.resp := fifelse(is.na(date.resp), 0, 1)]
+```
+
+# Covariates
+## Chronic conditions
+```{r}
+dx.cohort <- bind_rows(dx_clean, dx_latest)[patient_pssn %in% cohort.full$id]
+
+Cov.Dx <- readxl::read_excel("CARE-COPD.xlsx", sheet = "dx.cov")
+setDT(Cov.Dx)
+fx_PMH<-function(cov_code,master_sheet,dx_cohort){
+  ids <- full_join(master_sheet[,.(id, index)],
+                   dx_cohort[code %ilike% cov_code[,Regex],.(id = patient_pssn,date.dx)]
+                   )[date.dx < index & floor_date(index-730.5,unit="month") <= date.dx, unique(id)]
+  master_sheet[,(cov_code[,Name]) := fifelse(id %in% ids, 1, 0)]
+}
+
+for (i in 1:nrow(Cov.Dx)){
+  fx_PMH(Cov.Dx[i,],cohort.full,dx.cohort)
+  print(Cov.Dx$Description[i])
+}
+
+dx <- colnames(cohort.full)[str_detect(colnames(cohort.full), "^dx")]
+
+cohort.full[,CCI := dx.mi+dx.chf+dx.pvd+dx.cbd+dx.copd+dx.dementia+dx.paralysis+(dx.dm_com0&!dx.dm_com1)+dx.dm_com1*2+dx.crf*2+(dx.liver_mild&!dx.liver_modsev)+dx.liver_modsev*3+dx.ulcers+dx.ra+dx.aids*6+dx.cancer*2+dx.cancer_mets*6]
+```
+
+## Frailty score
+```{r}
+frail <- readxl::read_excel("CARE-COPD.xlsx", sheet = "frailty")
+setDT(frail)
+
+fx_frailty<-function(frailty_code,master_sheet,dx_cohort){
+  ids<-merge(master_sheet[,.(id,index)],
+             dx_cohort[code %ilike% frailty_code[,icd9_regex],.(id = patient_pssn,date.dx)]
+             )[date.dx < index & floor_date(index-730.5,unit="month") <= date.dx,unique(id)]
+  master_sheet[,(frailty_code[,f_cd]):=ifelse(id %in% ids,frailty_code[,f_score],0)]
+}
+
+for (i in 1:nrow(frail)){
+  fx_frailty(frail[i,],cohort.full,dx.cohort)
+  print(frail$description[i])
+}
+
+cohort.full[,f_score:=rowSums(.SD),.SDcols=grep("f[0-9]",names(cohort.full))]
+```
+
+## Rx
+```{r}
+rx.cohort <- bind_rows(`2020`, RX_latest)[patient_pssn %in% cohort.full$id]
+
+Cov.Rx <- readxl::read_excel("CARE-COPD.xlsx", sheet = "rx.cov")
+setDT(Cov.Rx)
+fx_RxHis<-function(cov_code,master_sheet,rx_cohort){
+  ids <- full_join(master_sheet[,.(id, index)],
+                   rx_cohort[bnfno_p %ilike% cov_code[,Regex],.(id = patient_pssn,date.rx)]
+                   )[date.rx < index & floor_date(index-365.25,unit="month") <= date.rx, unique(id)]
+  master_sheet[,(cov_code[,Name]) := fifelse(id %in% ids, 1, 0)]
+}
+
+for (i in 1:nrow(Cov.Rx)){
+  fx_RxHis(Cov.Rx[i,],cohort.full,rx.cohort)
+  print(Cov.Rx$description[i])
+}
+
+saveRDS(cohort.full, file = paste0("CARE-COPD-", format(now(), "%Y%m%d"), ".RDS"))
+```
+
+# Determine observation end date
+```{r}
+cohort.full[vac == 2 | vac == 3, outcomedate.COVIDdeath := pmin(as.Date("2022-03-31"),
+                                                                dod, date3, na.rm = TRUE)]
+cohort.full[vac == 1, outcomedate.COVIDdeath := pmin(as.Date("2022-03-31"),
+                                                     dod, date1, na.rm = TRUE)]
+
+cohort.full[,time.COVIDdeath := as.numeric(outcomedate.COVIDdeath - index + 1)]
+
+cohort.full[vac == 2 | vac == 3, outcomedate.resp := pmin(as.Date("2022-03-31"),
+                                                          dod, date3, date.resp, na.rm = TRUE)]
+cohort.full[vac == 1, outcomedate.resp := pmin(as.Date("2022-03-31"),
+                                               dod, date1, date.resp, na.rm = TRUE)]
+cohort.full[,time.resp := as.numeric(outcomedate.resp - index + 1)]
+cohort.full$vac <- as.factor(cohort.full$vac)
+
+cohort.full[time.COVIDdeath < 0 , exc := 1]
+cohort.full[time.resp < 0 , exc := 1]
+```
+
+# Weighting
+```{r}
+cohort.full[,vaccinated := fifelse(vac == "1", "0", "1")]
+cohort.full[vac == 2 | vac == 3, vaccine := substr(vac1brand,1,1)]
+cohort.full[vac == 1, vaccine := "N"]
+
+cohort.full$vaccine <- factor(cohort.full$vaccine, levels = c("N", "B", "S"))
+
+w1 <- weightit(vaccine ~ 
+                 age + sex 
+               + CCI + f_score
+               + dx.chf + dx.htn + dx.dm + dx.cbd + dx.ihd + dx.pvd + dx.af + dx.rf + dx.rd + dx.ulcers + dx.ld + dx.hip_frac + dx.park
+               + rx.diur + rx.aa + rx.bb + rx.htn + rx.ccb_nit + rx.oac + rx.platelet + rx.acs + rx.lipid + rx.histamine + rx.ap + rx.depress + rx.epileptics + rx.park + rx.demen + rx.abx + rx.av + rx.dm + rx.steroid,
+               data = cohort.full[is.na(exc)], 
+               estimand = "ATT", 
+               method = "ps", 
+               focal = "N")
+
+cohort.COPD.w1 <- svydesign(ids=~1, weights = ~w1$weights, data = cohort.full[is.na(exc)])
+
+svycoxph(formula = Surv(time = time.COVIDdeath, event = event.COVIDdeath) ~ vaccine, 
+         design = cohort.COPD.w1) %>% tbl_regression(exp = TRUE)
+
+svycoxph(formula = Surv(time = time.resp, event = event.resp) ~ vaccine, 
+         design = cohort.COPD.w1) %>% tbl_regression(exp = TRUE)
+```
+
+
+
